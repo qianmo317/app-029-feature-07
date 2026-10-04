@@ -9,7 +9,7 @@
 import { getGlyphGeom, type FontFamily } from './fontLoader'
 import { emptySamples, minSetDistance } from './geometry'
 import type { GlyphGeom } from './glyphAnalysis'
-import type { Align, CharItem, GlyphInfo, LayoutDef, LayoutSettings, Project, SignPanel } from './types'
+import type { Align, CharItem, GlyphInfo, LayoutDef, LayoutSettings, LineOverride, Project, SignPanel } from './types'
 
 export interface PlacedChar {
   index: number
@@ -39,6 +39,14 @@ export interface LineLayout {
   inkTop: number
   inkBottom: number
   width: number
+  /** 生效对齐（逐行覆盖值 ?? 全局 settings.align） */
+  effAlign: Align
+  /** 生效的「到下一行墨迹间隙」mm（最后一行为 null） */
+  effGapAfterMm: number | null
+  /** 生效的整行上下偏移 mm */
+  effOffsetYMm: number
+  /** 该行是否有任何单独设置（false = 全部跟随全局） */
+  overridden: boolean
 }
 
 export interface MarginInfo {
@@ -159,13 +167,17 @@ interface BuildResult {
   gapSpread: number
 }
 
+/** 该行是否单独设过（任一字段有值即算；false = 全部跟随全局） */
+export function hasLineOverride(ov: LineOverride | null | undefined): boolean {
+  return !!ov && (ov.align !== undefined || ov.gapMm !== undefined || ov.offsetYMm !== undefined)
+}
+
 function buildAtSize(
   def: LayoutDef,
   inner: { x: number; y: number; w: number; h: number },
   itemsByLine: Map<number, CharItem[]>,
   lineNos: number[],
-  sizeMm: number,
-  justify: boolean
+  sizeMm: number
 ): BuildResult {
   const st = def.settings
   const k = sizeMm / 1000
@@ -174,9 +186,14 @@ function buildAtSize(
   const lineGaps = new Map<number, number>()
   let missingCount = 0
   let gapSpread = 0
+  // 逐行覆盖取值（旧项目可能没有 lines 字段；JSON 读回的稀疏数组可能含 null）
+  const ovAt = (ln: number): LineOverride | undefined => def.lines?.[ln] ?? undefined
 
   for (const ln of lineNos) {
     const items = itemsByLine.get(ln) ?? []
+    const ov = ovAt(ln)
+    const lineAlign = ov?.align ?? st.align
+    const justify = lineAlign === 'justify'
     const geoms = items.map((it) => {
       const g = getGlyphGeom(st.fontId, st.weight, it.char)
       const ok = !!g && !g.missing
@@ -248,39 +265,63 @@ function buildAtSize(
     const inkRight = chars.length ? Math.max(...chars.map((c) => c.x + c.inkW)) : 0
     const inkTop = chars.length ? Math.min(...chars.map((c) => c.y)) : 0
     const inkBottom = chars.length ? Math.max(...chars.map((c) => c.y + c.inkH)) : 0
-    lines.push({ line: ln, chars, inkLeft, inkRight, inkTop, inkBottom, width: inkRight - inkLeft })
+    lines.push({
+      line: ln,
+      chars,
+      inkLeft,
+      inkRight,
+      inkTop,
+      inkBottom,
+      width: inkRight - inkLeft,
+      effAlign: lineAlign,
+      effGapAfterMm: null,
+      effOffsetYMm: ov?.offsetYMm ?? 0,
+      overridden: hasLineOverride(ov)
+    })
     placed.push(...chars)
   }
 
-  // 纵向：按基线排布，行距 = 字号 ×(1 + lineGapRatio)
-  const pitch = sizeMm * (1 + st.lineGapRatio)
+  // 纵向：逐行累加步进。行 n → 下一行的墨迹间隙 = 行 n 的覆盖值 ?? lineGapRatio × 字号；
+  // 行号跳空（空行）时每跳一档仍计一个字高 + 一个间隙，与旧版「行号 × 均匀步进」行为一致
+  const defaultGap = st.lineGapRatio * sizeMm
+  const gapAfterMap = new Map<number, number>()
+  let yCursor = 0
+  let prevLn: number | null = null
   for (const l of lines) {
-    const off = l.line * pitch
-    for (const c of l.chars) c.y += off
-    l.inkTop += off
-    l.inkBottom += off
+    const from = prevLn === null ? 0 : prevLn
+    for (let n = from; n < l.line; n++) {
+      const g = ovAt(n)?.gapMm ?? defaultGap
+      gapAfterMap.set(n, round2(g))
+      yCursor += sizeMm + g
+    }
+    for (const c of l.chars) c.y += yCursor
+    l.inkTop += yCursor
+    l.inkBottom += yCursor
+    prevLn = l.line
   }
+  for (const l of lines) l.effGapAfterMm = gapAfterMap.get(l.line) ?? null
 
-  // 水平对齐（逐行：左对齐/居中/右对齐/两端对齐）
+  // 水平对齐（逐行生效值：左对齐/居中/右对齐；两端对齐行在字距分配阶段已撑满，按左对齐落位）
   for (const l of lines) {
     let shiftX = inner.x - l.inkLeft
     const w = l.inkRight - l.inkLeft
-    if (st.align === 'center') shiftX = inner.x + (inner.w - w) / 2 - l.inkLeft
-    else if (st.align === 'right') shiftX = inner.x + inner.w - l.inkRight
+    if (l.effAlign === 'center') shiftX = inner.x + (inner.w - w) / 2 - l.inkLeft
+    else if (l.effAlign === 'right') shiftX = inner.x + inner.w - l.inkRight
     for (const c of l.chars) c.x += shiftX
     l.inkLeft += shiftX
     l.inkRight += shiftX
   }
 
-  // 垂直居中
+  // 垂直居中（整体墨迹居中；逐行/逐字偏移在居中之后叠加，不参与居中计算）
   const top = lines.length ? Math.min(...lines.map((l) => l.inkTop)) : 0
   const bottom = lines.length ? Math.max(...lines.map((l) => l.inkBottom)) : 0
   const occupiedH = Math.max(0, bottom - top)
   const shiftY = inner.y + (inner.h - occupiedH) / 2 - top
-  for (const c of placed) c.y += shiftY + c.item.offsetYMm
+  for (const c of placed) c.y += shiftY + (ovAt(c.line)?.offsetYMm ?? 0) + c.item.offsetYMm
   for (const l of lines) {
-    l.inkTop += shiftY
-    l.inkBottom += shiftY
+    const lineOff = ovAt(l.line)?.offsetYMm ?? 0
+    l.inkTop += shiftY + lineOff
+    l.inkBottom += shiftY + lineOff
   }
 
   const left = lines.length ? Math.min(...lines.map((l) => l.inkLeft)) : 0
@@ -302,14 +343,13 @@ function fitSize(
   def: LayoutDef,
   inner: { x: number; y: number; w: number; h: number },
   itemsByLine: Map<number, CharItem[]>,
-  lineNos: number[],
-  justify: boolean
+  lineNos: number[]
 ): number {
   const availW = inner.w * (1 - def.settings.marginRatio * 2)
   const availH = inner.h * (1 - def.settings.marginRatio * 2)
   let s = Math.max(5, def.settings.baseSizeMm)
   for (let i = 0; i < 16; i++) {
-    const r = buildAtSize(def, inner, itemsByLine, lineNos, s, justify)
+    const r = buildAtSize(def, inner, itemsByLine, lineNos, s)
     // 空排版（还没输入文字）不参与反算，避免字号发散
     if (r.occupiedW < 0.5 && r.occupiedH < 0.5) break
     const ratio = Math.max(Math.max(r.occupiedW, 1e-6) / availW, Math.max(r.occupiedH, 1e-6) / availH)
@@ -337,12 +377,11 @@ export function computeLayout(def: LayoutDef, opts: LayoutOptions = {}): LayoutR
     itemsByLine.set(it.line, arr)
   }
   const lineNos = [...itemsByLine.keys()].sort((a, b) => a - b)
-  const justify = st.align === 'justify'
 
   let sizeMm = st.baseSizeMm
-  if (opts.autoSize) sizeMm = fitSize(def, inner, itemsByLine, lineNos, justify)
+  if (opts.autoSize) sizeMm = fitSize(def, inner, itemsByLine, lineNos)
 
-  const built = buildAtSize(def, inner, itemsByLine, lineNos, sizeMm, justify)
+  const built = buildAtSize(def, inner, itemsByLine, lineNos, sizeMm)
   const { lines, placed } = built
   const inkLeft = placed.length ? Math.min(...placed.map((c) => c.x)) : inner.x
   const inkRight = placed.length ? Math.max(...placed.map((c) => c.x + c.inkW)) : inner.x
@@ -367,12 +406,14 @@ export function computeLayout(def: LayoutDef, opts: LayoutOptions = {}): LayoutR
   if (overflowYMm > 0) warnings.push(`超出安装区高度 ${overflowYMm}mm`)
   for (const g of glyphs) warnings.push(...g.warnings)
   if (placed.length > 0 && deltaX > 1) warnings.push(`左右留边不对称（差 ${deltaX}mm）`)
-  if (!justify && st.trackRatio < 0.04) warnings.push('默认字距比例过小，字与字容易粘连')
-  if (!justify && st.trackRatio > 0.35) warnings.push('默认字距比例过大，整排会显得松散')
+  // 只要存在非两端对齐的行，默认字距比例就有意义，才需要检查
+  const anyNonJustify = lineNos.some((ln) => (def.lines?.[ln]?.align ?? st.align) !== 'justify')
+  if (anyNonJustify && st.trackRatio < 0.04) warnings.push('默认字距比例过小，字与字容易粘连')
+  if (anyNonJustify && st.trackRatio > 0.35) warnings.push('默认字距比例过大，整排会显得松散')
 
   let suggestedSizeMm: number | null = null
   if ((overflowXMm > 0 || overflowYMm > 0) && !opts.autoSize) {
-    suggestedSizeMm = fitSize(def, inner, itemsByLine, lineNos, justify)
+    suggestedSizeMm = fitSize(def, inner, itemsByLine, lineNos)
   }
 
   const justifyGapMm = built.lineGaps.size
@@ -502,6 +543,7 @@ export function defaultProject(id: string, panel?: Partial<SignPanel>): Project 
     layout: {
       panel: { wMm: 3000, hMm: 800, mounting: 'board', frameMm: 60, ...panel },
       items: [],
+      lines: [],
       settings: {
         align: 'center',
         baseSizeMm: 300,
@@ -548,6 +590,36 @@ export function textToItems(text: string, prev: CharItem[], settings: LayoutSett
       })
       seq++
     }
+  })
+  return out
+}
+
+/**
+ * 文字改动后重新认行：逐行设置按「行的文字内容」认领，不按行号。
+ * - 每个新行在旧行中找「内容完全相同」的行继承设置；相同内容有多行时按出现顺序一一配对；
+ * - 删掉一行 / 插入一行：其余行内容不变 → 设置不串位；
+ * - 某行内容被改得完全不同 → 视为新行，该行设置丢失（其余行不受影响）；
+ * - 两行内容完全相同时删掉其中一行：剩下的行认领排在前面的那份设置。
+ */
+export function remapLineOverrides(
+  newText: string,
+  prevItems: CharItem[],
+  prevLines: LineOverride[] | undefined
+): LineOverride[] {
+  const oldTexts: string[] = []
+  for (const it of prevItems) {
+    while (oldTexts.length <= it.line) oldTexts.push('')
+    oldTexts[it.line] += it.char
+  }
+  const newTexts = newText.split('\n')
+  const used = new Set<number>()
+  const out: LineOverride[] = []
+  newTexts.forEach((t, i) => {
+    const j = oldTexts.findIndex((ot, oi) => !used.has(oi) && ot === t)
+    if (j < 0) return
+    used.add(j)
+    const ov = prevLines?.[j]
+    if (hasLineOverride(ov)) out[i] = { ...(ov as LineOverride) }
   })
   return out
 }

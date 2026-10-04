@@ -3,11 +3,11 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import PanelPreview from '../components/PanelPreview.vue'
 import { findFont, fontState, listFonts } from '../logic/fontLoader'
-import { round1, textToItems } from '../logic/layout'
+import { alignLabel, hasLineOverride, remapLineOverrides, round1, textToItems } from '../logic/layout'
 import { getProject } from '../logic/store'
 import { loadPrefs, savePrefs } from '../logic/store'
 import { useSession } from '../logic/useSession'
-import type { CharMode, Project } from '../logic/types'
+import type { Align, CharMode, LineOverride, Project } from '../logic/types'
 
 const route = useRoute()
 const id = String(route.params.id)
@@ -38,7 +38,10 @@ const text = computed({
   set: (v: string) => {
     const p = project.value
     if (!p) return
-    p.layout.items = textToItems(v.replace(/\r/g, ''), p.layout.items, p.layout.settings, layout.value?.sizeMm ?? p.layout.settings.baseSizeMm)
+    const clean = v.replace(/\r/g, '')
+    // 先按「行内容」重新认领逐行设置（用旧 items 重建旧行文本），再重新生成逐字项
+    p.layout.lines = remapLineOverrides(clean, p.layout.items, p.layout.lines)
+    p.layout.items = textToItems(clean, p.layout.items, p.layout.settings, layout.value?.sizeMm ?? p.layout.settings.baseSizeMm)
     if (active.value !== null && active.value >= p.layout.items.length) active.value = p.layout.items.length ? 0 : null
   }
 })
@@ -119,6 +122,81 @@ function applySuggested(): void {
   if (!p || !l || l.suggestedSizeMm === null) return
   session.autoFit.value = false
   p.layout.settings.baseSizeMm = l.suggestedSizeMm
+}
+
+// ---------- 逐行设置（缺省 = 跟随全局；任一字段设过即「已单独设置」） ----------
+interface LineRow {
+  line: number
+  text: string
+  ov: LineOverride
+  isSet: boolean
+  effAlign: Align
+  effGap: number | null
+  effOffset: number
+}
+
+const lineRows = computed<LineRow[]>(() => {
+  const p = project.value
+  if (!p) return []
+  const texts: string[] = []
+  for (const it of p.layout.items) {
+    while (texts.length <= it.line) texts.push('')
+    texts[it.line] += it.char
+  }
+  const l = layout.value
+  const st = p.layout.settings
+  const sizeMm = l?.sizeMm ?? st.baseSizeMm
+  const rows: LineRow[] = []
+  texts.forEach((t, i) => {
+    const ov: LineOverride = p.layout.lines?.[i] ?? {}
+    const isSet = hasLineOverride(ov)
+    // 空行且没有单独设置时不占列表（空行没有可对齐的墨迹）
+    if (!t && !isSet) return
+    const ll = l?.lines.find((x) => x.line === i)
+    rows.push({
+      line: i,
+      text: t,
+      ov,
+      isSet,
+      effAlign: ov.align ?? st.align,
+      effGap: ll ? ll.effGapAfterMm : round1(st.lineGapRatio * sizeMm),
+      effOffset: ov.offsetYMm ?? 0
+    })
+  })
+  return rows
+})
+
+function patchLine(line: number, patch: Partial<LineOverride>): void {
+  const p = project.value
+  if (!p) return
+  if (!Array.isArray(p.layout.lines)) p.layout.lines = []
+  const next: LineOverride = { ...(p.layout.lines[line] ?? {}), ...patch }
+  // 字段清空（undefined）即回到「跟随全局」
+  if (next.align === undefined) delete next.align
+  if (next.gapMm === undefined) delete next.gapMm
+  if (next.offsetYMm === undefined) delete next.offsetYMm
+  p.layout.lines[line] = next
+}
+
+function resetLine(line: number): void {
+  const p = project.value
+  if (!p || !Array.isArray(p.layout.lines)) return
+  p.layout.lines[line] = {}
+}
+
+function onLineAlign(line: number, e: Event): void {
+  const v = (e.target as HTMLSelectElement).value
+  patchLine(line, { align: v === '' ? undefined : (v as Align) })
+}
+
+function onLineGap(line: number, e: Event): void {
+  const v = (e.target as HTMLInputElement).value
+  patchLine(line, { gapMm: v === '' || !Number.isFinite(Number(v)) ? undefined : round1(Number(v)) })
+}
+
+function onLineOffset(line: number, e: Event): void {
+  const v = (e.target as HTMLInputElement).value
+  patchLine(line, { offsetYMm: v === '' || !Number.isFinite(Number(v)) ? undefined : round1(Number(v)) })
 }
 
 function setAutoFit(v: boolean): void {
@@ -255,6 +333,13 @@ function areaM2(w: number, h: number): string {
             </div>
           </div>
           <div class="field">
+            <label>默认行距比例（墨迹间隙）</label>
+            <div class="ctl">
+              <input type="number" v-model.number="project.layout.settings.lineGapRatio" min="0" max="2" step="0.01" />
+              <span class="muted">={{ (project.layout.settings.lineGapRatio * (layout ? layout.sizeMm : 0)).toFixed(1) }}mm</span>
+            </div>
+          </div>
+          <div class="field">
             <label>工艺下限（最细笔画 mm）</label>
             <div class="ctl"><input type="number" v-model.number="project.layout.settings.strokeLimitMm" min="1" step="1" /></div>
           </div>
@@ -353,6 +438,55 @@ function areaM2(w: number, h: number): string {
                 视觉间距按字形轮廓的最近距离计算（不是文本框宽度相减）；两端对齐时按视觉间距平均分配，因此各行间距极差≈0。
               </p>
             </div>
+          </div>
+
+          <div class="card" style="margin-top: 14px" v-if="layout && lineRows.length">
+            <header>
+              <h2>逐行设置</h2>
+              <span class="hint">留空即跟随左侧排版设置；文字改动后按「行内容」重新认领，删行/插行不串位</span>
+            </header>
+            <div v-for="row in lineRows" :key="row.line" class="line-row" :class="{ 'is-set': row.isSet }">
+              <div class="line-title">
+                <span>
+                  <b>第 {{ row.line + 1 }} 行</b>
+                  <span class="mono" style="margin-left: 6px">{{ row.text || '（空行）' }}</span>
+                </span>
+                <span class="tag" :class="row.isSet ? 'warn' : ''">{{ row.isSet ? '已单独设置' : '跟随全局' }}</span>
+              </div>
+              <div class="row" style="margin-top: 6px">
+                <select :value="row.ov.align ?? ''" @change="onLineAlign(row.line, $event)">
+                  <option value="">跟随全局（{{ alignLabel(project.layout.settings.align) }}）</option>
+                  <option value="left">靠左</option>
+                  <option value="center">居中</option>
+                  <option value="right">靠右</option>
+                  <option value="justify">撑满整行</option>
+                </select>
+                <input
+                  type="number"
+                  style="width: 110px"
+                  :value="row.ov.gapMm ?? ''"
+                  :placeholder="`行间隙 跟随 ${round1(project.layout.settings.lineGapRatio * layout.sizeMm)}mm`"
+                  step="1"
+                  @input="onLineGap(row.line, $event)"
+                />
+                <input
+                  type="number"
+                  style="width: 110px"
+                  :value="row.ov.offsetYMm ?? ''"
+                  placeholder="上下偏移 0mm"
+                  step="1"
+                  @input="onLineOffset(row.line, $event)"
+                />
+                <button v-if="row.isSet" style="padding: 4px 8px" @click="resetLine(row.line)">复位</button>
+              </div>
+              <div class="muted" style="margin-top: 4px">
+                生效：{{ alignLabel(row.effAlign) }} · 到下一行墨迹间隙 {{ row.effGap === null ? '—（末行）' : `${row.effGap}mm` }} · 上下偏移
+                {{ row.effOffset }}mm
+              </div>
+            </div>
+            <p class="muted" style="margin: 4px 0 0">
+              认领口径：按该行的文字内容匹配（不按行号）。删一行或插一行时其余行内容不变、设置不串位；把某行文字改得完全不同则该行视为新行、设置丢失。
+            </p>
           </div>
 
           <div class="card" style="margin-top: 14px" v-if="layout">

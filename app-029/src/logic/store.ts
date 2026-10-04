@@ -36,9 +36,25 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
+/**
+ * 旧项目兼容迁移：缺失字段一律按当前默认值补齐（缺字段不能导致打不开）。
+ * 例如早期项目没有 layout.lines（逐行设置）、settings.lineGapRatio 等，
+ * 打开时按现有全局默认值接着用。
+ */
+export function normalizeProject(p: Project): Project {
+  const d = defaultProject(p.id)
+  if (!p.layout) p.layout = d.layout
+  p.layout.panel = { ...d.layout.panel, ...(p.layout.panel ?? {}) }
+  p.layout.settings = { ...d.layout.settings, ...(p.layout.settings ?? {}) }
+  if (!Array.isArray(p.layout.items)) p.layout.items = []
+  if (!Array.isArray(p.layout.lines)) p.layout.lines = []
+  p.led = { ...d.led, ...(p.led ?? {}) }
+  return p
+}
+
 export function listProjects(): Project[] {
   const list = readJson<Project[]>(KEY_PROJECTS, [])
-  return list.sort((a, b) => b.updatedAt - a.updatedAt)
+  return list.map(normalizeProject).sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
 export function getProject(id: string): Project | null {

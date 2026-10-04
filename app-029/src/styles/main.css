@@ -406,6 +406,26 @@ tr.row-active td {
   flex-wrap: wrap;
 }
 
+.line-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: #fff;
+}
+
+.line-row.is-set {
+  border-color: #f0d9ae;
+  background: var(--warn-soft);
+}
+
+.line-row .line-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .char-cell {
   border: 1px solid var(--line);
   border-radius: 8px;

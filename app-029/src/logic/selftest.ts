@@ -6,11 +6,12 @@
 import testchars from '../data/testchars.json'
 import { computeLed } from './led'
 import { clearGeometryCache, ensureFont, findFont, getGlyphGeom } from './fontLoader'
-import { computeLayout, defaultProject, textToItems, type LayoutResult } from './layout'
+import { computeLayout, defaultProject, hasLineOverride, remapLineOverrides, textToItems, type LayoutResult } from './layout'
 import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
 import { nestPieces, type Piece } from './nesting'
+import { normalizeProject } from './store'
 import { runBlockCount, type BlockCountResult } from './testRunner'
-import type { LayoutDef, Project } from './types'
+import type { LayoutDef, LayoutSettings, LineOverride, Project } from './types'
 import type { Ring } from './geometry'
 import { pointInRings } from './geometry'
 
@@ -375,6 +376,98 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       pass: cmp.every((c) => c.totalCents === c.panelCents + c.ledCents + c.psuCents + c.accessoryCents + c.laborCents),
       detail: `${cmp.length} 种材质`,
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
+    })
+  }
+
+  // ---------- 11. 逐行设置：覆盖生效 / 跟随联动 / 重新认行不串位 / 旧项目兼容 ----------
+  {
+    const ev: string[] = []
+    // (a) 覆盖生效：行 1 单独「靠右 + 行间隙 120mm」；行 2 跟随全局居中
+    const p = makeProject('acc11', '广告招牌\n制作', 200, 'center')
+    p.layout.lines = [{ align: 'right', gapMm: 120 }]
+    const r = computeLayout(p.layout)
+    const l0 = r.lines.find((l) => l.line === 0)!
+    const l1 = r.lines.find((l) => l.line === 1)!
+    const rightEdge = r.inner.x + r.inner.w
+    const alignOk =
+      l0.effAlign === 'right' && l0.overridden && near(l0.inkRight, rightEdge, 0.2) && l1.effAlign === 'center' && !l1.overridden
+    ev.push(
+      `行1 单独设「靠右 + 间隙 120mm」：墨迹右边界 ${r1(l0.inkRight)}mm ≈ 安装区右缘 ${r1(rightEdge)}mm；行2 生效=${l1.effAlign}（跟随全局，overridden=${l1.overridden}）`
+    )
+
+    // (b) 行间隙覆盖：与无覆盖项目对比，差值应精确等于 120 − 0.18×字号
+    const pRef = makeProject('acc11b', '广告招牌\n制作', 200, 'center')
+    const rRef = computeLayout(pRef.layout)
+    const gapDelta = l1.inkTop - l0.inkBottom - (rRef.lines[1].inkTop - rRef.lines[0].inkBottom)
+    const expectDelta = 120 - p.layout.settings.lineGapRatio * r.sizeMm
+    const gapOk = near(gapDelta, expectDelta, 0.2) && l0.effGapAfterMm === 120
+    ev.push(
+      `行间隙：覆盖后两行墨迹间隙 ${r1(l1.inkTop - l0.inkBottom)}mm，比全局值多 ${r1(gapDelta)}mm（应 = 120 − 0.18×${r.sizeMm} = ${r1(expectDelta)}mm）`
+    )
+
+    // (c) 整行上下偏移：行 1 下移 40mm，行 2 不动
+    const pOff = makeProject('acc11c', '广告招牌\n制作', 200, 'center')
+    pOff.layout.lines = [{ offsetYMm: 40 }]
+    const rOff = computeLayout(pOff.layout)
+    const d0 = rOff.chars.find((c) => c.line === 0)!.y - rRef.chars.find((c) => c.line === 0)!.y
+    const d1 = rOff.chars.find((c) => c.line === 1)!.y - rRef.chars.find((c) => c.line === 1)!.y
+    const offOk = near(d0, 40, 0.2) && near(d1, 0, 0.2)
+    ev.push(`行1 单独下移 40mm：行1 字符 y 净增 ${r1(d0)}mm，行2 净增 ${r1(d1)}mm（应 ≈0）`)
+
+    // (d) 改全局值：只有跟随的行会动，覆盖行不动
+    const pF = makeProject('acc11d', '广告招牌\n制作', 200, 'center')
+    pF.layout.lines = [{ align: 'right' }]
+    const rF1 = computeLayout(pF.layout)
+    const ovRightBefore = rF1.lines[0].inkRight
+    const followLeftBefore = rF1.lines[1].inkLeft
+    pF.layout.settings.align = 'left'
+    const rF2 = computeLayout(pF.layout)
+    const followOk =
+      near(rF2.lines[0].inkRight, ovRightBefore, 0.01) &&
+      !near(rF2.lines[1].inkLeft, followLeftBefore, 0.01) &&
+      near(rF2.lines[1].inkLeft, rF2.inner.x, 0.2)
+    ev.push(
+      `全局对齐 居中→左：覆盖行（靠右）墨迹右边界 ${r1(ovRightBefore)}→${r1(rF2.lines[0].inkRight)}mm 不动；跟随行左边界 ${r1(followLeftBefore)}→${r1(rF2.lines[1].inkLeft)}mm 跟着动（= 安装区左缘 ${r1(rF2.inner.x)}mm）`
+    )
+
+    // (e) 重新认行：按「行内容」认领，删行/插行不串位
+    const st = pRef.layout.settings
+    const prevItems = textToItems('广告招牌\n制作', [], st, 200)
+    const prevLines: LineOverride[] = [{}, { align: 'right', gapMm: 99 }]
+    const afterInsert = remapLineOverrides('广告招牌\n门头\n制作', prevItems, prevLines)
+    const insertOk =
+      !hasLineOverride(afterInsert[0]) &&
+      !hasLineOverride(afterInsert[1]) &&
+      afterInsert[2]?.align === 'right' &&
+      afterInsert[2]?.gapMm === 99
+    const afterDelete = remapLineOverrides('制作', prevItems, prevLines)
+    const deleteOk = afterDelete.length === 1 && afterDelete[0]?.align === 'right' && afterDelete[0]?.gapMm === 99
+    ev.push(
+      `「制作」行设过靠右+间隙99：中间插入一行后设置跟到第 3 行（${insertOk ? '✓' : '✗'}）；删到只剩「制作」后设置落在第 1 行（${deleteOk ? '✓' : '✗'}）——按行内容认领，不按行号`
+    )
+
+    // (f) 旧项目缺字段：按当前全局默认值补齐，能正常打开并排版
+    const legacy = JSON.parse(JSON.stringify(pRef)) as Project
+    delete legacy.layout.lines
+    delete (legacy.layout.settings as Partial<LayoutSettings>).lineGapRatio
+    const norm = normalizeProject(legacy)
+    const rLegacy = computeLayout(norm.layout)
+    const legacyOk =
+      Array.isArray(norm.layout.lines) &&
+      norm.layout.settings.lineGapRatio === 0.18 &&
+      rLegacy.lines.length === 2 &&
+      !rLegacy.lines.some((l) => l.overridden)
+    ev.push(
+      `旧项目（无 lines 字段、无 lineGapRatio）：补齐后行距比例 ${norm.layout.settings.lineGapRatio}，${rLegacy.lines.length} 行全部跟随全局，排版正常`
+    )
+
+    const pass = alignOk && gapOk && offOk && followOk && insertOk && deleteOk && legacyOk
+    checks.push({
+      id: 'A11',
+      title: '逐行设置：覆盖生效、跟随行随全局联动、按行内容重新认行不串位、旧项目缺字段可打开',
+      pass,
+      detail: pass ? '通过' : '未通过',
+      evidence: ev
     })
   }
 

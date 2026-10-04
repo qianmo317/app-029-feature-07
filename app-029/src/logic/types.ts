@@ -27,6 +27,19 @@ export interface CharItem {
   seq?: number
 }
 
+/**
+ * 逐行设置（只存「单独设过」的字段，缺省 = 跟随全局 LayoutSettings）。
+ * 认领口径：按「行的文字内容」匹配，不按行号——见 layout.ts 的 remapLineOverrides。
+ */
+export interface LineOverride {
+  /** 该行对齐方式（缺省跟随 settings.align） */
+  align?: Align
+  /** 该行与下一行之间的墨迹间隙 mm（缺省 = settings.lineGapRatio × 字号） */
+  gapMm?: number
+  /** 整行上下偏移 mm，正值向下（缺省 = 0） */
+  offsetYMm?: number
+}
+
 export interface LayoutSettings {
   align: Align
   baseSizeMm: number
@@ -45,6 +58,8 @@ export interface LayoutDef {
   panel: SignPanel
   items: CharItem[]
   settings: LayoutSettings
+  /** 逐行设置（下标 = 行号）；缺省/空对象 = 该行全部跟随全局。旧项目无此字段时按 [] 处理 */
+  lines?: LineOverride[]
 }
 
 export interface LedCfg {

@@ -55,7 +55,7 @@ app-029/
     │   ├── geometry.ts        曲线离散化、环几何量、环绕数、形状最近距离（热路径用类型化数组）
     │   ├── glyphAnalysis.ts   轮廓→环→嵌套/连通域（扫描线并查集）→最细笔画（法线射线法）
     │   ├── fontLoader.ts      本地字体加载/解析/缓存（失败即提示「该字体不可用」）
-    │   ├── layout.ts          排版引擎（视觉间距求解、两端对齐、自动字号、逐字微调）
+    │   ├── layout.ts          排版引擎（视觉间距求解、两端对齐、自动字号、逐行设置、逐字微调）
     │   ├── led.ts             LED 与电源计算（含档位与多电源提示）
     │   ├── nesting.ts         亚克力板材分层装箱（guillotine）与利用率
     │   ├── materials.ts       材料清单（BOM，整数「分」）与多材质对照
@@ -92,7 +92,9 @@ app-029/
 
 字段以规格书第 7 节为准，为实现第 4/5 节功能补充了少量字段：`SignPanel.frameMm`（有效安装区边框）、
 `CharItem.line / trackTouched / seq`（多行、逐字微调是否手动改过、字序）、`LayoutSettings.weight / strokeLimitMm /
-trackRatio / marginRatio / lineGapRatio`、`Project` 增 `sheetId / ledModuleId / panelMaterialId`。
+trackRatio / marginRatio / lineGapRatio`、`LayoutDef.lines`（逐行设置 `LineOverride`：每行可单独设
+对齐/行间隙/上下偏移，缺省跟随全局；文字改动后按「行内容」重新认领，删行插行不串位；旧项目缺该字段时按全局值补齐）、
+`Project` 增 `sheetId / ledModuleId / panelMaterialId`。
 
 ### 字体授权与字集
 
