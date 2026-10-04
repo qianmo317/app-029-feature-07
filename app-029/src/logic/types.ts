@@ -37,14 +37,36 @@ export interface LayoutSettings {
   trackRatio: number
   /** 自动字号时预留的左右留边比例 */
   marginRatio: number
-  /** 行距（行与行之间墨迹间隙）= lineGapRatio × 字号 */
+  /** 默认行距（行与行之间墨迹间隙）= lineGapRatio × 字号 */
   lineGapRatio: number
+}
+
+/**
+ * 逐行排版设置：身份是「这一行的文字内容」（lineText + 同内容第几次出现），
+ * 不是行序号——插行/删行/改文字重认行时按内容对回，后面的行不串位。
+ * 三个字段各自独立：null = 没单独设过，跟随 LayoutSettings 里的全局值，
+ * 改全局值时只有跟随的行会动；非 null 即「单独设过」，界面要一眼能看出来。
+ */
+export interface LineTuning {
+  /** 该行文字（重认行后由排版引擎按新内容改写） */
+  text: string
+  /** 逐行对齐；null = 跟随全局 align */
+  align: Align | null
+  /**
+   * 本行墨迹底边到下一行墨迹顶边的间隙 mm；null = 跟随全局 lineGapRatio × 字号。
+   * 记在「上一行」名下；最后一行的该值不参与排版。
+   */
+  gapBelowMm: number | null
+  /** 本行整体上下偏移 mm（正值向下）；null/0 跟随全局即不偏移 */
+  offsetYMm: number | null
 }
 
 export interface LayoutDef {
   panel: SignPanel
   items: CharItem[]
   settings: LayoutSettings
+  /** 逐行设置（旧项目可能没有该字段，读取时按空数组合规化：全部跟随全局） */
+  lineTunings?: LineTuning[]
 }
 
 export interface LedCfg {

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ensureFont, findFont, listFonts } from '../logic/fontLoader'
-import { computeLayout, mountingLabel, textToItems } from '../logic/layout'
+import { computeLayout, mountingLabel, syncLayoutText, textToItems } from '../logic/layout'
 import { buildBom } from '../logic/materials'
 import { compareMaterials } from '../logic/materials'
 import { bomGroupLabel } from '../logic/quote'
@@ -156,7 +156,15 @@ function applyUnified(): void {
     p.layout.settings.baseSizeMm = unify.baseSizeMm
     p.layout.settings.align = unify.align
     p.layout.settings.trackRatio = unify.trackRatio
-    p.layout.items = textToItems(p.layout.items.map((i) => i.char).join(''), p.layout.items, p.layout.settings, unify.baseSizeMm)
+    // 保持原有的多行结构（按行重建 items，同时让逐行设置按文字内容重新认行）
+    const text = p.layout.items
+      .reduce<string[]>((lines, it) => {
+        while (lines.length <= it.line) lines.push('')
+        lines[it.line] += it.char
+        return lines
+      }, [])
+      .join('\n')
+    syncLayoutText(p.layout, text, unify.baseSizeMm)
     saveProject(p)
     ensureFont(p.layout.settings.fontId, p.layout.settings.weight).catch(() => undefined)
   }

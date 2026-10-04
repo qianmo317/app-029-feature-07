@@ -559,6 +559,68 @@ svg.panel-svg {
   }
 }
 
+/* 逐行排版 */
+.line-table {
+  width: 100%;
+}
+
+.line-table tbody tr {
+  cursor: pointer;
+}
+
+.line-table tbody tr.active {
+  background: var(--brand-soft);
+}
+
+.line-table .line-text {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.line-table .num-input {
+  width: 84px;
+  padding: 2px 6px;
+}
+
+.line-table select.touched,
+.line-table input.touched {
+  border-color: #e8710a;
+  background: #fff7ef;
+  font-weight: 600;
+}
+
+.tag.ind {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  background: #e8710a;
+}
+
+.tag.follow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #5b6577;
+  background: #e7ebf2;
+}
+
 @media print {
   .no-print,
   .topbar {

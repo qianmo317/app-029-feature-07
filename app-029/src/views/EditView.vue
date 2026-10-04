@@ -3,11 +3,19 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import PanelPreview from '../components/PanelPreview.vue'
 import { findFont, fontState, listFonts } from '../logic/fontLoader'
-import { round1, textToItems } from '../logic/layout'
+import {
+  alignLabel,
+  clearAllLineTunings,
+  clearLineTuning,
+  round1,
+  setLineTuning,
+  splitLines,
+  syncLayoutText
+} from '../logic/layout'
 import { getProject } from '../logic/store'
 import { loadPrefs, savePrefs } from '../logic/store'
 import { useSession } from '../logic/useSession'
-import type { CharMode, Project } from '../logic/types'
+import type { Align, CharMode, LineTuning, Project } from '../logic/types'
 
 const route = useRoute()
 const id = String(route.params.id)
@@ -15,6 +23,8 @@ const loaded = ref<Project | null>(getProject(id))
 const session = useSession(loaded)
 const overlays = ref({ blocks: true, minStroke: true, led: false })
 const active = ref<number | null>(0)
+/** 当前选中的行序号（0 起） */
+const activeLine = ref(0)
 const fontError = ref('')
 
 const project = computed(() => loaded.value)
@@ -24,24 +34,89 @@ const weightOptions = computed(() =>
   project.value ? findFont(project.value.layout.settings.fontId)?.weights.map((w) => w.weight) ?? [] : []
 )
 
+/** 当前文本的行（按 \n 拆，空行保留）——逐行设置的展示顺序 */
+const lineTexts = computed<string[]>(() => {
+  const p = project.value
+  if (!p) return []
+  const lines: string[] = []
+  for (const it of p.layout.items) {
+    while (lines.length <= it.line) lines.push('')
+    lines[it.line] += it.char
+  }
+  return lines
+})
+
 const text = computed({
-  get: () => {
-    const p = project.value
-    if (!p) return ''
-    const lines: string[] = []
-    for (const it of p.layout.items) {
-      while (lines.length <= it.line) lines.push('')
-      lines[it.line] += it.char
-    }
-    return lines.join('\n')
-  },
+  get: () => lineTexts.value.join('\n'),
   set: (v: string) => {
     const p = project.value
     if (!p) return
-    p.layout.items = textToItems(v.replace(/\r/g, ''), p.layout.items, p.layout.settings, layout.value?.sizeMm ?? p.layout.settings.baseSizeMm)
+    // 按字重新认行 + 按行文字内容重认逐行设置（插行/删行不串位）
+    syncLayoutText(p.layout, v.replace(/\r/g, ''), layout.value?.sizeMm ?? p.layout.settings.baseSizeMm)
     if (active.value !== null && active.value >= p.layout.items.length) active.value = p.layout.items.length ? 0 : null
+    if (activeLine.value >= splitLines(v).length) activeLine.value = 0
   }
 })
+
+interface LineRow {
+  line: number
+  text: string
+  occurrence: number
+  tuning: LineTuning | null
+}
+
+/** 行设置行表（按内容 + 同内容第几次出现定位） */
+const lineRows = computed<LineRow[]>(() => {
+  const p = project.value
+  if (!p) return []
+  const counts = new Map<string, number>()
+  return lineTexts.value.map((t, line) => {
+    const occurrence = counts.get(t) ?? 0
+    counts.set(t, occurrence + 1)
+    const list = (p.layout.lineTunings ?? []).filter((x) => x.text === t)
+    return { line, text: t, occurrence, tuning: list[occurrence] ?? null }
+  })
+})
+
+const activeRow = computed<LineRow | null>(() => lineRows.value[activeLine.value] ?? null)
+
+/** 未单独设间隙时的跟随值（mm） */
+const globalGapMm = computed(() => round1((project.value?.layout.settings.lineGapRatio ?? 0) * (layout.value?.sizeMm ?? 0)))
+
+function rowAlign(row: LineRow): Align {
+  return row.tuning?.align ?? project.value!.layout.settings.align
+}
+function rowGap(row: LineRow): number {
+  return row.tuning?.gapBelowMm ?? globalGapMm.value
+}
+function rowOffset(row: LineRow): number {
+  return row.tuning?.offsetYMm ?? 0
+}
+
+function setRowAlign(row: LineRow, v: Align): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { align: v })
+}
+function setRowGap(row: LineRow, v: number): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { gapBelowMm: round1(v) })
+}
+function setRowOffset(row: LineRow, v: number): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { offsetYMm: round1(v) })
+}
+function resetRowAlign(row: LineRow): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { align: null })
+}
+function resetRowGap(row: LineRow): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { gapBelowMm: null })
+}
+function resetRowOffset(row: LineRow): void {
+  setLineTuning(project.value!.layout, row.text, row.occurrence, { offsetYMm: null })
+}
+function resetRow(row: LineRow): void {
+  clearLineTuning(project.value!.layout, row.text, row.occurrence)
+}
+function resetAllLines(): void {
+  clearAllLineTunings(project.value!.layout)
+}
 
 const perfText = computed(() => (session.perfMs.value ? `${session.perfMs.value.toFixed(1)}ms` : '—'))
 const fontStatus = computed(() => {
@@ -255,6 +330,13 @@ function areaM2(w: number, h: number): string {
             </div>
           </div>
           <div class="field">
+            <label>全局行距（行间墨迹间隙）</label>
+            <div class="ctl">
+              <input type="number" v-model.number="project.layout.settings.lineGapRatio" min="0" max="2" step="0.02" />
+              <span class="muted">={{ (project.layout.settings.lineGapRatio * (layout ? layout.sizeMm : 0)).toFixed(1) }}mm · 只动没单独设过的行</span>
+            </div>
+          </div>
+          <div class="field">
             <label>工艺下限（最细笔画 mm）</label>
             <div class="ctl"><input type="number" v-model.number="project.layout.settings.strokeLimitMm" min="1" step="1" /></div>
           </div>
@@ -291,6 +373,7 @@ function areaM2(w: number, h: number): string {
               :show-led="overlays.led"
               :night="nightPref"
               :active-char="active"
+              :active-line="activeLine"
             />
             <p v-else class="muted">字体加载中…</p>
           </div>
@@ -353,6 +436,148 @@ function areaM2(w: number, h: number): string {
                 视觉间距按字形轮廓的最近距离计算（不是文本框宽度相减）；两端对齐时按视觉间距平均分配，因此各行间距极差≈0。
               </p>
             </div>
+          </div>
+
+          <div class="card" style="margin-top: 14px" v-if="layout">
+            <header>
+              <h2>逐行排版</h2>
+              <span class="hint">逐行设置按「这一行的文字内容」认行，插行/删行不会串位；改文字重认行时小改字也留得住</span>
+            </header>
+            <p class="muted">
+              每行可单独设：对齐（靠左/居中/靠右/撑满整行可用宽度）、本行到下一行的墨迹间隙、本行整体上下偏移。
+              没单独设过的项跟着上面的全局走，改全局只有跟随的行会动。
+            </p>
+            <table class="line-table">
+              <thead>
+                <tr>
+                  <th class="num">#</th>
+                  <th>行内容</th>
+                  <th>对齐</th>
+                  <th class="num">到下一行墨迹间隙 mm</th>
+                  <th class="num">上下偏移 mm</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="r in lineRows"
+                  :key="`${r.line}-${r.occurrence}`"
+                  :class="{ active: activeLine === r.line }"
+                  @click="activeLine = r.line"
+                >
+                  <td class="num">{{ r.line + 1 }}</td>
+                  <td class="line-text">{{ r.text === '' ? '（空行）' : r.text }}</td>
+                  <td>
+                    <select
+                      :value="rowAlign(r)"
+                      :class="{ touched: r.tuning?.align !== null && r.tuning?.align !== undefined }"
+                      @click.stop
+                      @change="setRowAlign(r, ($event.target as HTMLSelectElement).value as Align)"
+                    >
+                      <option value="left">靠左</option>
+                      <option value="center">居中</option>
+                      <option value="right">靠右</option>
+                      <option value="justify">撑满整行</option>
+                    </select>
+                    <span class="tag ind" v-if="r.tuning?.align !== null && r.tuning?.align !== undefined" title="已单独设置">独</span>
+                    <span class="tag follow" v-else title="跟随全局">随</span>
+                  </td>
+                  <td class="num">
+                    <input
+                      type="number"
+                      class="num-input"
+                      :value="rowGap(r)"
+                      step="1"
+                      :disabled="r.line === lineRows.length - 1"
+                      :class="{ touched: r.tuning?.gapBelowMm !== null && r.tuning?.gapBelowMm !== undefined }"
+                      @click.stop
+                      @input="setRowGap(r, Number(($event.target as HTMLInputElement).value))"
+                    />
+                    <span class="tag ind" v-if="r.line < lineRows.length - 1 && r.tuning?.gapBelowMm !== null && r.tuning?.gapBelowMm !== undefined">独</span>
+                    <span class="tag follow" v-else-if="r.line < lineRows.length - 1">随</span>
+                    <span class="muted" v-else>末行</span>
+                  </td>
+                  <td class="num">
+                    <input
+                      type="number"
+                      class="num-input"
+                      :value="rowOffset(r)"
+                      step="1"
+                      :class="{ touched: r.tuning?.offsetYMm !== null && r.tuning?.offsetYMm !== undefined }"
+                      @click.stop
+                      @input="setRowOffset(r, Number(($event.target as HTMLInputElement).value))"
+                    />
+                    <span class="tag ind" v-if="r.tuning?.offsetYMm !== null && r.tuning?.offsetYMm !== undefined">独</span>
+                    <span class="tag follow" v-else>随</span>
+                  </td>
+                  <td>
+                    <button style="padding: 1px 6px" :disabled="!r.tuning" @click.stop="resetRow(r)">复位本行</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="row" style="margin-top: 8px; gap: 8px">
+              <button @click="resetAllLines">全部恢复跟随全局</button>
+              <span class="tag ind">独</span><span class="muted">= 这一项单独设过（只动这一行）</span>
+              <span class="tag follow">随</span><span class="muted">= 跟随全局（改全局会跟着动）</span>
+            </div>
+
+            <template v-if="activeRow">
+              <div class="field" style="margin-top: 12px">
+                <label>第 {{ activeRow.line + 1 }} 行「{{ activeRow.text === '' ? '空行' : activeRow.text }}」对齐</label>
+                <div class="ctl">
+                  <select :value="rowAlign(activeRow)" @change="setRowAlign(activeRow, ($event.target as HTMLSelectElement).value as Align)">
+                    <option value="left">靠左</option>
+                    <option value="center">居中</option>
+                    <option value="right">靠右</option>
+                    <option value="justify">撑满整行可用宽度</option>
+                  </select>
+                  <button :disabled="activeRow.tuning?.align === null || activeRow.tuning?.align === undefined" @click="resetRowAlign(activeRow)">
+                    恢复跟随全局
+                  </button>
+                  <span class="muted" v-if="activeRow.tuning?.align === null || activeRow.tuning?.align === undefined">
+                    当前跟随全局：{{ alignLabel(project.layout.settings.align) }}
+                  </span>
+                  <span class="muted" v-else>已单独设为：{{ alignLabel(rowAlign(activeRow)) }}</span>
+                </div>
+              </div>
+              <div class="field" v-if="activeRow.line < lineRows.length - 1">
+                <label>本行下方墨迹间隙（mm，上一行墨迹底到本行墨迹顶）</label>
+                <div class="ctl">
+                  <input type="number" :value="rowGap(activeRow)" step="1" @input="setRowGap(activeRow, Number(($event.target as HTMLInputElement).value))" />
+                  <button @click="setRowGap(activeRow, rowGap(activeRow) - 5)">−5</button>
+                  <button @click="setRowGap(activeRow, rowGap(activeRow) - 1)">−1</button>
+                  <button @click="setRowGap(activeRow, rowGap(activeRow) + 1)">+1</button>
+                  <button @click="setRowGap(activeRow, rowGap(activeRow) + 5)">+5</button>
+                  <button
+                    :disabled="activeRow.tuning?.gapBelowMm === null || activeRow.tuning?.gapBelowMm === undefined"
+                    @click="resetRowGap(activeRow)"
+                  >
+                    恢复跟随全局
+                  </button>
+                  <span class="muted" v-if="activeRow.tuning?.gapBelowMm === null || activeRow.tuning?.gapBelowMm === undefined">
+                    当前跟随全局：{{ globalGapMm }}mm
+                  </span>
+                  <span class="muted" v-else>已单独设为 {{ rowGap(activeRow) }}mm（改全局不影响本行）</span>
+                </div>
+              </div>
+              <div class="field">
+                <label>本行整体上下偏移（mm，正值向下；只挪本行，不带动别的行）</label>
+                <div class="ctl">
+                  <input type="number" :value="rowOffset(activeRow)" step="1" @input="setRowOffset(activeRow, Number(($event.target as HTMLInputElement).value))" />
+                  <button @click="setRowOffset(activeRow, rowOffset(activeRow) - 5)">−5</button>
+                  <button @click="setRowOffset(activeRow, rowOffset(activeRow) - 1)">−1</button>
+                  <button @click="setRowOffset(activeRow, rowOffset(activeRow) + 1)">+1</button>
+                  <button @click="setRowOffset(activeRow, rowOffset(activeRow) + 5)">+5</button>
+                  <button
+                    :disabled="activeRow.tuning?.offsetYMm === null || activeRow.tuning?.offsetYMm === undefined"
+                    @click="resetRowOffset(activeRow)"
+                  >
+                    恢复跟随全局
+                  </button>
+                </div>
+              </div>
+            </template>
           </div>
 
           <div class="card" style="margin-top: 14px" v-if="layout">

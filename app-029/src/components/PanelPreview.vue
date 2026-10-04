@@ -15,6 +15,7 @@ const props = withDefaults(
     showLed?: boolean
     night?: boolean
     activeChar?: number | null
+    activeLine?: number | null
   }>(),
   {
     showDims: true,
@@ -23,7 +24,8 @@ const props = withDefaults(
     showMinStroke: false,
     showLed: false,
     night: false,
-    activeChar: null
+    activeChar: null,
+    activeLine: null
   }
 )
 
@@ -93,6 +95,29 @@ const dots = computed(() => (props.showLed ? ledDots(props.layout.chars, props.p
 const strokeMm = computed(() => Math.max(4, props.layout.sizeMm * 0.02))
 const overflow = computed(() => props.layout.overflowX || props.layout.overflowY)
 const markerR = computed(() => Math.max(panel.value.hMm, panel.value.wMm) * 0.012)
+
+interface LineFrame {
+  line: number
+  x: number
+  y: number
+  w: number
+  h: number
+  active: boolean
+  tuned: boolean
+}
+
+/** 各行墨迹外框：选中行高亮描边；有逐行设置的行带淡色底色，预览里一眼看出哪些行单独设过 */
+const lineFrames = computed<LineFrame[]>(() =>
+  props.layout.lines.map((l) => ({
+    line: l.line,
+    x: l.inkLeft,
+    y: l.inkTop,
+    w: Math.max(0.1, l.inkRight - l.inkLeft),
+    h: Math.max(0.1, l.inkBottom - l.inkTop),
+    active: props.activeLine === l.line,
+    tuned: l.tuned
+  }))
+)
 </script>
 
 <template>
@@ -132,6 +157,23 @@ const markerR = computed(() => Math.max(panel.value.hMm, panel.value.wMm) * 0.01
         :stroke-width="labelSize * 0.1"
         :stroke-dasharray="`${labelSize * 0.5} ${labelSize * 0.3}`"
       />
+
+      <!-- 逐行设置标记：有单独设置的行淡橙底，当前选中行蓝框 -->
+      <g v-if="layout.chars.length">
+        <rect
+          v-for="f in lineFrames"
+          :key="`lf${f.line}`"
+          :x="f.x - labelSize * 0.25"
+          :y="f.y - labelSize * 0.25"
+          :width="f.w + labelSize * 0.5"
+          :height="f.h + labelSize * 0.5"
+          :rx="labelSize * 0.15"
+          :fill="f.active ? 'rgba(31,111,235,0.10)' : f.tuned ? 'rgba(232,113,10,0.08)' : 'none'"
+          :stroke="f.active ? '#1f6feb' : f.tuned ? '#e8710a' : 'none'"
+          :stroke-width="f.active ? labelSize * 0.12 : labelSize * 0.06"
+          :stroke-dasharray="f.active ? undefined : `${labelSize * 0.4} ${labelSize * 0.3}`"
+        />
+      </g>
 
       <!-- 字形 -->
       <g

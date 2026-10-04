@@ -6,7 +6,18 @@
 import testchars from '../data/testchars.json'
 import { computeLed } from './led'
 import { clearGeometryCache, ensureFont, findFont, getGlyphGeom } from './fontLoader'
-import { computeLayout, defaultProject, textToItems, type LayoutResult } from './layout'
+import {
+  computeLayout,
+  defaultProject,
+  findLineTuning,
+  normalizeTunings,
+  reconcileLineTunings,
+  setLineTuning,
+  syncLayoutText,
+  textToItems,
+  type LayoutResult
+} from './layout'
+import { migrateProject } from './store'
 import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
 import { nestPieces, type Piece } from './nesting'
 import { runBlockCount, type BlockCountResult } from './testRunner'
@@ -375,6 +386,133 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       pass: cmp.every((c) => c.totalCents === c.panelCents + c.ledCents + c.psuCents + c.accessoryCents + c.laborCents),
       detail: `${cmp.length} 种材质`,
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
+    })
+  }
+
+  // ---------- 11. 逐行排版（独立/跟随、按内容认行、旧项目缺字段） ----------
+  {
+    const ev: string[] = []
+    const p = makeProject('acc11', '第一行\n第二行文字\n第三行', 300, 'center')
+    const gapAt = (r: LayoutResult): number[] => r.lines.map((l) => Math.round((l.gapBelowMm ?? -999) * 10) / 10)
+
+    // 1) 第 2 行单独：靠右、间隙 90mm、上移 30mm
+    setLineTuning(p.layout, '第二行文字', 0, { align: 'right', gapBelowMm: 90, offsetYMm: -30 })
+    let r = computeLayout(p.layout)
+    const l1 = r.lines[1]
+    const alignOk = l1.align === 'right' && r.lines[0].align === 'center' && r.lines[2].align === 'center'
+    const gapOk = gapAt(r)[1] === 90
+    // 墨迹间隙口径：间隙记在「上一行」名下——90mm 管的是第 2→3 行；第 2 行的 -30 偏移只挪自己
+    const l0 = r.lines[0]
+    const l2 = r.lines[2]
+    const inkGapOk = r1(l1.inkTop - l0.inkBottom) === 24 // 默认 54 - 本行上移 30
+    const baseGapUntouched = r1(l1.inkTop - l0.inkBottom + 30) === 54 // 去掉本行偏移，第 1→2 行仍是默认间隙
+    const nextGapUntouched = r1(l2.inkTop - (l1.inkBottom + 30)) === 90 // 第 3 行按 90 接在第 2 行「未偏移位置」后
+    ev.push(
+      `三行居中，第 2 行单独设 靠右/间隙90mm/上移30mm：各行对齐=${r.lines.map((x) => x.align).join(',')}；间隙序列=${gapAt(r).join(',')}mm`,
+      `第 2 行墨迹顶=${r1(l1.inkTop)}，第 1 行底=${r1(l0.inkBottom)}：视觉间隙 ${r1(l1.inkTop - l0.inkBottom)}mm（默认54 - 本行上移30）；第 3 行相对第 2 行未偏移位置的间隙=${r1(
+        l2.inkTop - (l1.inkBottom + 30)
+      )}mm（=90，行偏移不带动别的行）`
+    )
+
+    // 2) 改全局对齐与行距：只有跟随的行跟着动
+    p.layout.settings.align = 'left'
+    p.layout.settings.lineGapRatio = 0.5 // 300mm 字号 → 150mm
+    r = computeLayout(p.layout)
+    const globalFollowOk =
+      r.lines[0].align === 'left' && r.lines[1].align === 'right' && r.lines[2].align === 'left' && gapAt(r)[0] === 150 && gapAt(r)[1] === 90 && gapAt(r)[2] === -999
+    ev.push(`改全局为靠左/行距150mm：跟随行变靠左、间隙150mm；第 2 行保持靠右、90mm（${globalFollowOk ? '✓' : '✗'}）`)
+
+    // 3) 改文字按字重认行：第 2 行小改（加一个字）设置留下；全改的行不抢设置
+    syncLayoutText(p.layout, '第一行\n第二行文字哦\n全新内容', 300)
+    const kept = findLineTuning(p.layout, '第二行文字哦', 0)
+    const stolen = findLineTuning(p.layout, '全新内容', 0)
+    const editOk = !!kept && kept.align === 'right' && kept.gapBelowMm === 90 && kept.offsetYMm === -30 && stolen === null
+    ev.push(`第 2 行加字「哦」、第 3 行整行换掉：设置随小改行保留=${!!kept}，被全改行不抢设置=${stolen === null}`)
+
+    // 4) 插行/删行按内容认行，不按行序号串位：在第 1 行前插入一行
+    syncLayoutText(p.layout, '新开张\n第一行\n第二行文字哦\n全新内容', 300)
+    r = computeLayout(p.layout)
+    const moved = r.lines.find((x) => x.text === '第二行文字哦')
+    const insertOk = moved?.align === 'right' && moved?.gapTouched && moved?.offsetTouched && moved.line === 2
+    const newLineFollows = r.lines[0].align === 'left' && r.lines[0].gapBelowMm === 150
+    ev.push(`最前面插入「新开张」：原第 2 行设置仍在（现第 3 行 line=${moved?.line}）；新行跟随全局靠左/150mm`)
+
+    // 删掉中间一行，后面的行不串位
+    syncLayoutText(p.layout, '新开张\n第二行文字哦', 300)
+    r = computeLayout(p.layout)
+    const afterDel = r.lines.find((x) => x.text === '第二行文字哦')
+    const delOk = afterDel?.align === 'right' && afterDel?.line === 1
+    ev.push(`删掉「第一行」：「第二行文字哦」带着靠右设置落到 line=1（${delOk ? '✓' : '✗'}）`)
+
+    // 5) 重复文字两行：各设各的，不互相顶替
+    syncLayoutText(p.layout, '同一句\n同一句', 300)
+    setLineTuning(p.layout, '同一句', 0, { align: 'left' })
+    setLineTuning(p.layout, '同一句', 1, { align: 'right' })
+    r = computeLayout(p.layout)
+    const dupOk = r.lines[0].align === 'left' && r.lines[1].align === 'right'
+    ev.push(`两行文字完全相同：第 1 行靠左、第 2 行靠右，各自独立（${dupOk ? '✓' : '✗'}）`)
+
+    // 6) 旧项目缺逐行设置/缺整个 settings 字段：能打开且按现有全局值接着用
+    const legacy = {
+      id: 'legacy1',
+      name: '旧项目',
+      layout: {
+        panel: { wMm: 3000, hMm: 800, mounting: 'board' },
+        items: [
+          { char: '旧', line: 0 },
+          { char: '字', line: 1 }
+        ],
+        settings: { align: 'right', baseSizeMm: 250, fontId: 'hei', weight: 400 }
+      }
+    }
+    const migrated = migrateProject(legacy)
+    const legacyOk =
+      !!migrated &&
+      migrated.layout.settings.lineGapRatio > 0 &&
+      Array.isArray(migrated.layout.lineTunings) &&
+      migrated.layout.lineTunings.length === 0 &&
+      migrated.layout.items.length === 2 &&
+      migrated.layout.items[1].line === 1
+    let legacyRenderOk = false
+    if (migrated) {
+      const lr = computeLayout(migrated.layout)
+      legacyRenderOk = lr.lines.length === 2 && lr.lines.every((x) => x.align === 'right')
+    }
+    ev.push(
+      `旧项目缺 lineGapRatio/lineTunings/frameMm 等字段：迁移后 lineGapRatio=${migrated?.layout.settings.lineGapRatio}、lineTunings=[]，两行按现有全局靠右渲染=${legacyRenderOk}`
+    )
+
+    // 7) 纯函数：重认行算法对「插入/删除/重复」直接给预期
+    const rec = reconcileLineTunings(['A', 'B', 'C'], [{ text: 'A', align: 'left', gapBelowMm: 10, offsetYMm: null }])
+    const pureOk = rec.length === 1 && rec[0].text === 'A' && rec[0].align === 'left'
+    const rec2 = reconcileLineTunings(['X', 'A', 'B'], rec)
+    const pureOk2 = rec2.length === 1 && rec2[0].text === 'A'
+    const garbageOk = normalizeTunings([null, 5, { text: 'z', align: 'bogus' }, { text: 'q', gapBelowMm: 12 }]).length === 1
+    ev.push(`重认行纯函数：插入后 A 的设置不绑序号（${pureOk && pureOk2 ? '✓' : '✗'}）；脏数据只保留合法条目=${garbageOk}`)
+
+    const pass =
+      !!alignOk &&
+      gapOk &&
+      !!inkGapOk &&
+      !!baseGapUntouched &&
+      !!nextGapUntouched &&
+      globalFollowOk &&
+      editOk &&
+      insertOk &&
+      newLineFollows &&
+      delOk &&
+      dupOk &&
+      legacyOk &&
+      legacyRenderOk &&
+      pureOk &&
+      pureOk2 &&
+      garbageOk
+    checks.push({
+      id: 'A11',
+      title: '逐行排版：每行可独立设对齐/墨迹间隙/上下偏移；未设跟随全局且改全局只动跟随行；改文字按内容重认行（插删不串位）；旧项目缺字段可打开',
+      pass,
+      detail: pass ? '通过' : '未通过',
+      evidence: ev
     })
   }
 

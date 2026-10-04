@@ -9,7 +9,7 @@
 import { getGlyphGeom, type FontFamily } from './fontLoader'
 import { emptySamples, minSetDistance } from './geometry'
 import type { GlyphGeom } from './glyphAnalysis'
-import type { Align, CharItem, GlyphInfo, LayoutDef, LayoutSettings, Project, SignPanel } from './types'
+import type { Align, CharItem, GlyphInfo, LayoutDef, LayoutSettings, LineTuning, Project, SignPanel } from './types'
 
 export interface PlacedChar {
   index: number
@@ -33,12 +33,28 @@ export interface PlacedChar {
 
 export interface LineLayout {
   line: number
+  /** 该行文字（空串 = 空行） */
+  text: string
   chars: PlacedChar[]
   inkLeft: number
   inkRight: number
   inkTop: number
   inkBottom: number
   width: number
+  /** 本行生效的对齐（已合并逐行/全局） */
+  align: Align
+  /** 是否单独设过对齐 */
+  alignTouched: boolean
+  /** 本行到下一行墨迹顶的实际间隙 mm（最后一行为 null） */
+  gapBelowMm: number | null
+  /** 是否单独设过该间隙 */
+  gapTouched: boolean
+  /** 本行整体上下偏移 mm */
+  offsetYMm: number
+  /** 是否单独设过上下偏移 */
+  offsetTouched: boolean
+  /** 是否有任意一项被单独设过（界面一眼看出） */
+  tuned: boolean
 }
 
 export interface MarginInfo {
@@ -147,6 +163,146 @@ export function effectiveTrack(item: CharItem, settings: LayoutSettings, sizeMm:
   return round1(settings.trackRatio * sizeMm)
 }
 
+/** 行设置为空（没单独设过任何一项）：重认行时直接丢弃，不占存储 */
+export function isEmptyTuning(t: LineTuning): boolean {
+  return t.align === null && t.gapBelowMm === null && t.offsetYMm === null
+}
+
+/** 规范化一条行设置（旧数据缺字段时补 null = 跟随全局），字段非法也按跟随处理 */
+export function normalizeTuning(raw: unknown): LineTuning | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const text = typeof o.text === 'string' ? o.text : ''
+  const alignOk = o.align === 'left' || o.align === 'center' || o.align === 'right' || o.align === 'justify'
+  const gapNum = typeof o.gapBelowMm === 'number' && Number.isFinite(o.gapBelowMm) ? round1(o.gapBelowMm) : null
+  const offNum = typeof o.offsetYMm === 'number' && Number.isFinite(o.offsetYMm) ? round1(o.offsetYMm) : null
+  const t: LineTuning = {
+    text,
+    align: alignOk ? (o.align as Align) : null,
+    gapBelowMm: gapNum,
+    offsetYMm: offNum
+  }
+  return isEmptyTuning(t) ? null : t
+}
+
+/**
+ * 把可能来自旧版本项目（缺字段/字段类型错）的 lineTunings 归一化。
+ * 原则：缺什么都不能打不开；缺的逐行设置一律按「跟随全局」处理。
+ */
+export function normalizeTunings(raw: unknown): LineTuning[] {
+  if (!Array.isArray(raw)) return []
+  const out: LineTuning[] = []
+  for (const item of raw) {
+    const t = normalizeTuning(item)
+    if (t) out.push(t)
+  }
+  return out
+}
+
+/** 「同内容第几次出现」索引：行设置按文字内容认行，重复文字也能各自定位 */
+type TuningIndex = Map<string, LineTuning[]>
+
+function indexTunings(tunings: LineTuning[]): TuningIndex {
+  const m: TuningIndex = new Map()
+  for (const t of tunings) {
+    const arr = m.get(t.text) ?? []
+    arr.push(t)
+    m.set(t.text, arr)
+  }
+  return m
+}
+
+/** 按当前行文字 + 同内容出现序号取行设置（occurrence 由调用方按行序计数） */
+function tuningByText(index: TuningIndex, text: string, occurrence = 0): LineTuning | null {
+  return index.get(text)?.[occurrence] ?? null
+}
+
+/** 最长公共子序列长度（DP；门头文案通常几行到几十行，O(n·m) 足够） */
+function lcsLen(a: string[], b: string[]): number {
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+  return dp[0][0]
+}
+
+/** 行相似度（按字符级 LCS / 较长行长度）：小改字时判定「还是同一行」的门槛 */
+function lineSimilarity(a: string, b: string): number {
+  if (!a || !b) return 0
+  const ca = [...a]
+  const cb = [...b]
+  return lcsLen(ca, cb) / Math.max(ca.length, cb.length)
+}
+
+/**
+ * 文字改过后重新认行，把旧的逐行设置搬到新行上（判定依据：行的文字内容，不是行序号）：
+ * 1. 先按 LCS 把「文字完全没变」的行一一对回（插行/删行/重复行都不串位）；
+ * 2. LCS 剩下的「被改动的旧行」与「新出现的行」在各配对段内按顺序就近配对，
+ *    字符相似度 ≥ 0.5（只改了一两个字）则认为还是同一行，设置留下并更新文字；
+ * 3. 其余新行没有设置（跟随全局）；删掉的行设置随之消失。
+ */
+export function reconcileLineTunings(newTexts: string[], prev: LineTuning[]): LineTuning[] {
+  const oldTexts = prev.map((t) => t.text)
+  const n = newTexts.length
+  const m = oldTexts.length
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = newTexts[i] === oldTexts[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+  // exact: 新行序号 -> 旧行序号
+  const exact = new Map<number, number>()
+  const usedOld = new Set<number>()
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (newTexts[i] === oldTexts[j]) {
+      exact.set(i, j)
+      usedOld.add(j)
+      i++
+      j++
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      i++
+    } else {
+      j++
+    }
+  }
+
+  const out: (LineTuning | null)[] = new Array<LineTuning | null>(n).fill(null)
+  for (const [ni, oi] of exact) {
+    out[ni] = { ...prev[oi], text: newTexts[ni] }
+  }
+  // 未配对段：旧改动行与新行做全局贪心最佳匹配（相似度 ≥ 0.5 才承接），
+  // 避免「顺序靠前但不像」的新行把设置抢走
+  const unmatchedOld = oldTexts.map((_, k) => k).filter((k) => !usedOld.has(k))
+  const unmatchedNew = newTexts.map((_, k) => k).filter((k) => !exact.has(k))
+  const candidates: Array<{ oi: number; ni: number; sim: number }> = []
+  for (const oi of unmatchedOld) {
+    for (const ni of unmatchedNew) {
+      const sim = lineSimilarity(oldTexts[oi], newTexts[ni])
+      if (sim >= 0.5) candidates.push({ oi, ni, sim })
+    }
+  }
+  candidates.sort((a, b) => b.sim - a.sim)
+  const assignedOld = new Set<number>()
+  const assignedNew = new Set<number>()
+  for (const c of candidates) {
+    if (assignedOld.has(c.oi) || assignedNew.has(c.ni)) continue
+    assignedOld.add(c.oi)
+    assignedNew.add(c.ni)
+    out[c.ni] = { ...prev[c.oi], text: newTexts[c.ni] }
+  }
+  return out.filter((t): t is LineTuning => t !== null && !isEmptyTuning(t))
+}
+
+/** 把多行文本拆成行数组：\n 个数即分隔数，空行保留为空串（去掉行尾 \r） */
+export function splitLines(text: string): string[] {
+  return text.replace(/\r/g, '').split('\n')
+}
+
 interface BuildResult {
   lines: LineLayout[]
   placed: PlacedChar[]
@@ -164,8 +320,7 @@ function buildAtSize(
   inner: { x: number; y: number; w: number; h: number },
   itemsByLine: Map<number, CharItem[]>,
   lineNos: number[],
-  sizeMm: number,
-  justify: boolean
+  sizeMm: number
 ): BuildResult {
   const st = def.settings
   const k = sizeMm / 1000
@@ -174,9 +329,17 @@ function buildAtSize(
   const lineGaps = new Map<number, number>()
   let missingCount = 0
   let gapSpread = 0
+  const tuningIndex = indexTunings(def.lineTunings ?? [])
+  const seenText = new Map<string, number>()
 
   for (const ln of lineNos) {
     const items = itemsByLine.get(ln) ?? []
+    const text = items.map((it) => it.char).join('')
+    const occ = seenText.get(text) ?? 0
+    seenText.set(text, occ + 1)
+    const tune = tuningByText(tuningIndex, text, occ)
+    const align: Align = tune?.align ?? st.align
+    const justify = align === 'justify'
     const geoms = items.map((it) => {
       const g = getGlyphGeom(st.fontId, st.weight, it.char)
       const ok = !!g && !g.missing
@@ -184,7 +347,7 @@ function buildAtSize(
       return { geom: ok ? (g as GlyphGeom) : missingGeom(it.char, st.fontId, st.weight), ok, blank: ok && (g as GlyphGeom).blank }
     })
     const pairs = Math.max(0, items.length - 1)
-    // 两端对齐：先按剩余宽度平均，再迭代 2 次让整行贴合有效安装区
+    // 两端对齐（仅本行）：先按剩余宽度平均，再迭代 2 次让整行贴合有效安装区
     let gTarget = 0
     if (justify && pairs > 0) {
       const inkSum = geoms.reduce((s, g) => s + (g.ok ? g.geom.inkW * k : sizeMm), 0)
@@ -248,31 +411,67 @@ function buildAtSize(
     const inkRight = chars.length ? Math.max(...chars.map((c) => c.x + c.inkW)) : 0
     const inkTop = chars.length ? Math.min(...chars.map((c) => c.y)) : 0
     const inkBottom = chars.length ? Math.max(...chars.map((c) => c.y + c.inkH)) : 0
-    lines.push({ line: ln, chars, inkLeft, inkRight, inkTop, inkBottom, width: inkRight - inkLeft })
+    lines.push({
+      line: ln,
+      text,
+      chars,
+      inkLeft,
+      inkRight,
+      inkTop,
+      inkBottom,
+      width: inkRight - inkLeft,
+      align,
+      alignTouched: tune?.align !== undefined && tune?.align !== null,
+      gapBelowMm: null,
+      gapTouched: tune?.gapBelowMm !== undefined && tune?.gapBelowMm !== null,
+      offsetYMm: tune?.offsetYMm ?? 0,
+      offsetTouched: tune?.offsetYMm !== undefined && tune?.offsetYMm !== null,
+      tuned:
+        (tune?.align !== undefined && tune?.align !== null) ||
+        (tune?.gapBelowMm !== undefined && tune?.gapBelowMm !== null) ||
+        (tune?.offsetYMm !== undefined && tune?.offsetYMm !== null)
+    })
     placed.push(...chars)
   }
 
-  // 纵向：按基线排布，行距 = 字号 ×(1 + lineGapRatio)
-  const pitch = sizeMm * (1 + st.lineGapRatio)
-  for (const l of lines) {
-    const off = l.line * pitch
-    for (const c of l.chars) c.y += off
-    l.inkTop += off
-    l.inkBottom += off
+  // 纵向堆叠：逐行以「墨迹间隙」摆放——上一行墨迹底边到本行墨迹顶边留 gapBelow。
+  // gapBelow 记在上一行名下；未单独设过的行跟随「lineGapRatio × 字号」。
+  // 行整体偏移在堆叠之后单独施加：只挪本行，不推开/挤压其它行。
+  const defaultGap = round1(st.lineGapRatio * sizeMm)
+  const stackSeen = new Map<string, number>()
+  let cursorY = 0
+  for (let idx = 0; idx < lines.length; idx++) {
+    const l = lines[idx]
+    const dy = cursorY - l.inkTop
+    for (const c of l.chars) c.y += dy
+    l.inkTop += dy
+    l.inkBottom += dy
+    const occ = stackSeen.get(l.text) ?? 0
+    stackSeen.set(l.text, occ + 1)
+    const tune = tuningByText(tuningIndex, l.text, occ)
+    const gap = idx < lines.length - 1 ? (tune?.gapBelowMm ?? defaultGap) : null
+    l.gapBelowMm = gap
+    l.gapTouched = tune?.gapBelowMm !== undefined && tune?.gapBelowMm !== null
+    cursorY = gap === null ? l.inkBottom : l.inkBottom + gap
+    if (l.offsetYMm) {
+      for (const c of l.chars) c.y += l.offsetYMm
+      l.inkTop += l.offsetYMm
+      l.inkBottom += l.offsetYMm
+    }
   }
 
-  // 水平对齐（逐行：左对齐/居中/右对齐/两端对齐）
+  // 水平对齐（逐行生效：左/居中/右/撑满整行可用宽度，已在水平排字阶段按本行设置处理两端对齐）
   for (const l of lines) {
     let shiftX = inner.x - l.inkLeft
     const w = l.inkRight - l.inkLeft
-    if (st.align === 'center') shiftX = inner.x + (inner.w - w) / 2 - l.inkLeft
-    else if (st.align === 'right') shiftX = inner.x + inner.w - l.inkRight
+    if (l.align === 'center') shiftX = inner.x + (inner.w - w) / 2 - l.inkLeft
+    else if (l.align === 'right') shiftX = inner.x + inner.w - l.inkRight
     for (const c of l.chars) c.x += shiftX
     l.inkLeft += shiftX
     l.inkRight += shiftX
   }
 
-  // 垂直居中
+  // 垂直居中（含逐行偏移后的实际墨迹范围）
   const top = lines.length ? Math.min(...lines.map((l) => l.inkTop)) : 0
   const bottom = lines.length ? Math.max(...lines.map((l) => l.inkBottom)) : 0
   const occupiedH = Math.max(0, bottom - top)
@@ -302,14 +501,13 @@ function fitSize(
   def: LayoutDef,
   inner: { x: number; y: number; w: number; h: number },
   itemsByLine: Map<number, CharItem[]>,
-  lineNos: number[],
-  justify: boolean
+  lineNos: number[]
 ): number {
   const availW = inner.w * (1 - def.settings.marginRatio * 2)
   const availH = inner.h * (1 - def.settings.marginRatio * 2)
   let s = Math.max(5, def.settings.baseSizeMm)
   for (let i = 0; i < 16; i++) {
-    const r = buildAtSize(def, inner, itemsByLine, lineNos, s, justify)
+    const r = buildAtSize(def, inner, itemsByLine, lineNos, s)
     // 空排版（还没输入文字）不参与反算，避免字号发散
     if (r.occupiedW < 0.5 && r.occupiedH < 0.5) break
     const ratio = Math.max(Math.max(r.occupiedW, 1e-6) / availW, Math.max(r.occupiedH, 1e-6) / availH)
@@ -331,18 +529,21 @@ export function computeLayout(def: LayoutDef, opts: LayoutOptions = {}): LayoutR
     h: Math.max(1, panel.hMm - panel.frameMm * 2)
   }
   const itemsByLine = new Map<number, CharItem[]>()
+  let maxLine = -1
   for (const it of def.items) {
     const arr = itemsByLine.get(it.line) ?? []
     arr.push(it)
     itemsByLine.set(it.line, arr)
+    if (it.line > maxLine) maxLine = it.line
   }
-  const lineNos = [...itemsByLine.keys()].sort((a, b) => a - b)
-  const justify = st.align === 'justify'
+  // 密集行槽：中间的空行也占位（高度为 0 的墨迹行，但照样可单独设对齐/间隙/偏移）
+  const lineNos: number[] = []
+  for (let ln = 0; ln <= maxLine; ln++) lineNos.push(ln)
 
   let sizeMm = st.baseSizeMm
-  if (opts.autoSize) sizeMm = fitSize(def, inner, itemsByLine, lineNos, justify)
+  if (opts.autoSize) sizeMm = fitSize(def, inner, itemsByLine, lineNos)
 
-  const built = buildAtSize(def, inner, itemsByLine, lineNos, sizeMm, justify)
+  const built = buildAtSize(def, inner, itemsByLine, lineNos, sizeMm)
   const { lines, placed } = built
   const inkLeft = placed.length ? Math.min(...placed.map((c) => c.x)) : inner.x
   const inkRight = placed.length ? Math.max(...placed.map((c) => c.x + c.inkW)) : inner.x
@@ -367,12 +568,13 @@ export function computeLayout(def: LayoutDef, opts: LayoutOptions = {}): LayoutR
   if (overflowYMm > 0) warnings.push(`超出安装区高度 ${overflowYMm}mm`)
   for (const g of glyphs) warnings.push(...g.warnings)
   if (placed.length > 0 && deltaX > 1) warnings.push(`左右留边不对称（差 ${deltaX}mm）`)
-  if (!justify && st.trackRatio < 0.04) warnings.push('默认字距比例过小，字与字容易粘连')
-  if (!justify && st.trackRatio > 0.35) warnings.push('默认字距比例过大，整排会显得松散')
+  const anyJustify = built.lines.some((l) => l.align === 'justify')
+  if (!anyJustify && st.trackRatio < 0.04) warnings.push('默认字距比例过小，字与字容易粘连')
+  if (!anyJustify && st.trackRatio > 0.35) warnings.push('默认字距比例过大，整排会显得松散')
 
   let suggestedSizeMm: number | null = null
   if ((overflowXMm > 0 || overflowYMm > 0) && !opts.autoSize) {
-    suggestedSizeMm = fitSize(def, inner, itemsByLine, lineNos, justify)
+    suggestedSizeMm = fitSize(def, inner, itemsByLine, lineNos)
   }
 
   const justifyGapMm = built.lineGaps.size
@@ -530,12 +732,11 @@ export function defaultProject(id: string, panel?: Partial<SignPanel>): Project 
 
 /** 把文本转成逐字项（保留已有微调值，多行用 \n 分隔） */
 export function textToItems(text: string, prev: CharItem[], settings: LayoutSettings, sizeMm: number): CharItem[] {
-  const lines = text.split('\n')
+  const lines = splitLines(text)
   const out: CharItem[] = []
   let seq = 0
   lines.forEach((lineText, li) => {
     for (const ch of lineText) {
-      if (ch === '\r') continue
       const old = prev.find((p) => p.seq === seq && p.char === ch)
       out.push({
         char: ch,
@@ -550,4 +751,56 @@ export function textToItems(text: string, prev: CharItem[], settings: LayoutSett
     }
   })
   return out
+}
+
+/**
+ * 文字改过后统一更新排版定义：
+ * 逐字项按字重新认行（textToItems），逐行设置按行文字内容重新认（reconcileLineTunings）。
+ * 判定依据是「文字内容」：插行/删行只影响对应内容，后面的行不串位。
+ */
+export function syncLayoutText(def: LayoutDef, text: string, sizeMm: number): void {
+  const lineTexts = splitLines(text)
+  def.items = textToItems(text, def.items, def.settings, sizeMm)
+  def.lineTunings = reconcileLineTunings(lineTexts, normalizeTunings(def.lineTunings))
+}
+
+/** 取当前文本对应的逐行设置（按内容+出现次数定位；不存在则返回 null） */
+export function findLineTuning(def: LayoutDef, text: string, occurrence: number): LineTuning | null {
+  const list = normalizeTunings(def.lineTunings).filter((t) => t.text === text)
+  return list[occurrence] ?? null
+}
+
+/** 写入某一行的逐行设置（不存在则新增；三项全回到跟随则删除该条） */
+export function setLineTuning(def: LayoutDef, text: string, occurrence: number, patch: Partial<Omit<LineTuning, 'text'>>): void {
+  const all = normalizeTunings(def.lineTunings)
+  let seen = 0
+  let found = false
+  for (let k = 0; k < all.length; k++) {
+    if (all[k].text !== text) continue
+    if (seen === occurrence) {
+      all[k] = { ...all[k], ...patch, text }
+      found = true
+      break
+    }
+    seen++
+  }
+  if (!found) all.push({ text, align: null, gapBelowMm: null, offsetYMm: null, ...patch })
+  def.lineTunings = all.filter((t) => !isEmptyTuning(t))
+}
+
+/** 清掉某一行的全部逐行设置（恢复为完全跟随全局） */
+export function clearLineTuning(def: LayoutDef, text: string, occurrence: number): void {
+  const all = normalizeTunings(def.lineTunings)
+  let seen = 0
+  def.lineTunings = all.filter((t) => {
+    if (t.text !== text) return true
+    const keep = seen !== occurrence
+    seen++
+    return keep
+  })
+}
+
+/** 清掉所有行的全部逐行设置（全部恢复跟随全局） */
+export function clearAllLineTunings(def: LayoutDef): void {
+  def.lineTunings = []
 }
